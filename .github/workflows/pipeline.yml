@@ -1,0 +1,132 @@
+name: Tourism Project Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  register-dataset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies (minimal)
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub==0.32.6 fsspec==2024.6.1 pandas==2.2.2
+
+      - name: Upload Dataset to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi, create_repo
+          from huggingface_hub.utils import RepositoryNotFoundError
+
+          repo_id = "Ansh91/tourism"     # DATASET repo
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          # Ensure dataset repo exists
+          try:
+              api.repo_info(repo_id=repo_id, repo_type="dataset")
+              print(f"Dataset repo '{repo_id}' exists.")
+          except RepositoryNotFoundError:
+              print(f"Dataset repo '{repo_id}' not found. Creating...")
+              create_repo(repo_id=repo_id, repo_type="dataset", private=False, token=os.environ["HF_TOKEN"])
+              print(f"Created dataset repo '{repo_id}'.")
+
+          # Upload tourism.csv from this repo (expects file at tourism/tourism.csv)
+          api.upload_file(
+              path_or_fileobj="tourism/tourism.csv",
+              path_in_repo="tourism.csv",
+              repo_id=repo_id,
+              repo_type="dataset",
+          )
+          print("✅ Uploaded tourism.csv to dataset repo.")
+          PY
+
+  data-prep:
+    needs: register-dataset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies (prep)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tourism/deployment/requirements.txt
+
+      - name: Run Data Preparation (splits & upload Xtrain/Xtest/ytrain/ytest)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python tourism/model_building/prep.py
+
+  model-traning:
+    needs: data-prep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies (train + mlflow)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tourism/deployment/requirements.txt
+
+      - name: Start MLflow Server (background)
+        run: |
+          nohup mlflow ui --host 0.0.0.0 --port 5000 &>/dev/null &
+          sleep 5
+
+      - name: Model Building (train & upload model to HF model repo)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+          MLFLOW_EXPERIMENT_NAME: tourism-wellness-package
+          HF_MODEL_REPO: Ansh91/tourism
+        run: |
+          python tourism/model_building/train.py
+
+  deploy-hosting:
+    needs: [model-traning, data-prep, register-dataset]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies (hosting)
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub==0.32.6
+
+      - name: Push deployment files to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python tourism/hosting/hosting.py
