@@ -11,8 +11,8 @@ from sklearn.metrics import classification_report
 # serialization & os
 import joblib, os
 # HF Hub
-from huggingface_hub import HfApi, create_repo
-from huggingface_hub.utils import RepositoryNotFoundError, HfHubHTTPError
+from huggingface_hub import HfApi, create_repo, hf_hub_download
+from huggingface_hub.utils import RepositoryNotFoundError
 # experiment tracking
 import mlflow
 
@@ -22,18 +22,32 @@ import mlflow
 mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
 mlflow.set_experiment(os.getenv("MLFLOW_EXPERIMENT_NAME", "tourism-wellness-package"))
 
+HF_DATASET_REPO = "Ansh91/tourism"                       # dataset repo with Xtrain/Xtest/ytrain/ytest
+HF_MODEL_REPO   = os.getenv("HF_MODEL_REPO", "Ansh91/tourism")  # model repo to upload artifact
+HF_TOKEN        = os.getenv("HF_TOKEN", None)
+
+# ✅ workspace-relative artifacts dir (works in Actions & Colab)
+ARTIFACT_DIR = os.getenv("ARTIFACT_DIR", os.path.join(os.getcwd(), "artifacts"))
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+MODEL_BASENAME = "best_tourism_model_v1.joblib"
+MODEL_PATH = os.path.join(ARTIFACT_DIR, MODEL_BASENAME)
+
+def read_csv_from_hf(repo_id: str, filename: str, repo_type: str = "dataset") -> pd.DataFrame:
+    """Try hf:// first; if it fails (private/no auth), fall back to hf_hub_download."""
+    path = f"hf://{'datasets' if repo_type=='dataset' else repo_type}/{repo_id}/{filename}"
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        local = hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type, token=HF_TOKEN)
+        return pd.read_csv(local)
+
 # ---------------------------
 # Load prepared splits from HF dataset repo
 # ---------------------------
-Xtrain_path = "hf://datasets/Ansh91/tourism/Xtrain.csv"
-Xtest_path  = "hf://datasets/Ansh91/tourism/Xtest.csv"
-ytrain_path = "hf://datasets/Ansh91/tourism/ytrain.csv"
-ytest_path  = "hf://datasets/Ansh91/tourism/ytest.csv"
-
-Xtrain = pd.read_csv(Xtrain_path)
-Xtest  = pd.read_csv(Xtest_path)
-ytrain = pd.read_csv(ytrain_path).squeeze()  # to 1D
-ytest  = pd.read_csv(ytest_path).squeeze()
+Xtrain = read_csv_from_hf(HF_DATASET_REPO, "Xtrain.csv")
+Xtest  = read_csv_from_hf(HF_DATASET_REPO, "Xtest.csv")
+ytrain = read_csv_from_hf(HF_DATASET_REPO, "ytrain.csv").squeeze()
+ytest  = read_csv_from_hf(HF_DATASET_REPO, "ytest.csv").squeeze()
 
 print("Prepared splits loaded successfully.")
 print("Xtrain:", Xtrain.shape, "Xtest:", Xtest.shape, "ytrain:", ytrain.shape, "ytest:", ytest.shape)
@@ -49,8 +63,8 @@ numeric_features = [
 categorical_features = [
     "TypeofContact","Occupation","Gender","MaritalStatus","Designation","ProductPitched"
 ]
-numeric_features      = [c for c in numeric_features if c in Xtrain.columns]
-categorical_features  = [c for c in categorical_features if c in Xtrain.columns]
+numeric_features     = [c for c in numeric_features if c in Xtrain.columns]
+categorical_features = [c for c in categorical_features if c in Xtrain.columns]
 
 # ---------------------------
 # Class imbalance (scale_pos_weight = neg/pos)
@@ -67,7 +81,6 @@ preprocessor = make_column_transformer(
     (OneHotEncoder(handle_unknown="ignore"), categorical_features),
     remainder="drop"
 )
-
 xgb_model = xgb.XGBClassifier(
     scale_pos_weight=scale_pos_weight,
     random_state=42,
@@ -75,8 +88,6 @@ xgb_model = xgb.XGBClassifier(
     tree_method="hist",
     eval_metric="logloss",
 )
-
-# Hyperparameter grid (sample-style)
 param_grid = {
     "xgbclassifier__n_estimators": [50, 75, 100],
     "xgbclassifier__max_depth": [2, 3, 4],
@@ -85,7 +96,6 @@ param_grid = {
     "xgbclassifier__learning_rate": [0.01, 0.05, 0.1],
     "xgbclassifier__reg_lambda": [0.4, 0.5, 0.6],
 }
-
 model_pipeline = make_pipeline(preprocessor, xgb_model)
 
 # ---------------------------
@@ -99,7 +109,7 @@ with mlflow.start_run():
     )
     search.fit(Xtrain, ytrain)
 
-    # log each tried set as nested run (like sample)
+    # nested runs logging (optional; keep like your sample)
     results = search.cv_results_
     for i in range(len(results["params"])):
         with mlflow.start_run(nested=True):
@@ -107,10 +117,9 @@ with mlflow.start_run():
             mlflow.log_metric("mean_test_score", float(results["mean_test_score"][i]))
             mlflow.log_metric("std_test_score",  float(results["std_test_score"][i]))
 
-    # log best params on main run
     mlflow.log_params(search.best_params_)
 
-    # evaluate with sample’s fixed threshold = 0.45
+    # evaluate at fixed threshold
     best_model = search.best_estimator_
     thr = 0.45
     y_pred_train = (best_model.predict_proba(Xtrain)[:, 1] >= thr).astype(int)
@@ -131,34 +140,28 @@ with mlflow.start_run():
     })
 
     # ---------------------------
-    # Save & upload model
+    # Save & upload model  (NO /content paths)
     # ---------------------------
-    os.makedirs("/content/tourism/artifacts", exist_ok=True)
-    model_path = "/content/tourism/artifacts/best_tourism_model_v1.joblib"
-    joblib.dump(best_model, model_path)
-    mlflow.log_artifact(model_path, artifact_path="model")
-    print(f"Model saved locally at: {model_path}")
+    joblib.dump(best_model, MODEL_PATH)
+    mlflow.log_artifact(MODEL_PATH, artifact_path="model")
+    print(f"Model saved locally at: {MODEL_PATH}")
 
-    # Upload to Hugging Face (model repo)
-    hf_token = os.getenv("HF_TOKEN", None)
-    api = HfApi(token=hf_token)
-    repo_id = os.getenv("HF_MODEL_REPO", "Ansh91/tourism")  # override via env if you prefer
+    api = HfApi(token=HF_TOKEN)
+    repo_id = HF_MODEL_REPO
     repo_type = "model"
-
-    # create model repo if missing
     try:
         api.repo_info(repo_id=repo_id, repo_type=repo_type)
         print(f"Model repo '{repo_id}' exists. Using it.")
     except RepositoryNotFoundError:
         print(f"Model repo '{repo_id}' not found. Creating...")
-        create_repo(repo_id=repo_id, repo_type=repo_type, private=False, token=hf_token)
+        create_repo(repo_id=repo_id, repo_type=repo_type, private=False, token=HF_TOKEN)
         print(f"Model repo '{repo_id}' created.")
 
-    # upload artifact
     api.upload_file(
-        path_or_fileobj=model_path,
-        path_in_repo=os.path.basename(model_path),
+        path_or_fileobj=MODEL_PATH,
+        path_in_repo=os.path.basename(MODEL_PATH),
         repo_id=repo_id,
         repo_type=repo_type,
     )
-    print(f"Uploaded model to HF: {repo_id}/{os.path.basename(model_path)}")
+    print(f"Uploaded model to HF: {repo_id}/{os.path.basename(MODEL_PATH)}")
+
