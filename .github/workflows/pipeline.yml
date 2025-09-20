@@ -2,8 +2,8 @@ name: Tourism Project Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
 
@@ -23,6 +23,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install huggingface_hub==0.32.6 fsspec==2024.6.1 pandas==2.2.2
 
+      # (Optional) show workspace to debug paths
+      - name: Debug workspace
+        run: |
+          pwd
+          ls -la
+          echo "--- find ---"
+          find . -maxdepth 3 -type f | sed 's|^\./||'
+
       - name: Upload Dataset to Hugging Face Hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -32,26 +40,33 @@ jobs:
           from huggingface_hub import HfApi, create_repo
           from huggingface_hub.utils import RepositoryNotFoundError
 
-          repo_id = "Ansh91/tourism"     # DATASET repo
+          REPO_ID = "Ansh91/tourism"   # DATASET repo
+          LOCAL   = "tourism.csv"      # <-- CSV is at repo root
+
           api = HfApi(token=os.environ["HF_TOKEN"])
 
           # Ensure dataset repo exists
           try:
-              api.repo_info(repo_id=repo_id, repo_type="dataset")
-              print(f"Dataset repo '{repo_id}' exists.")
+              api.repo_info(repo_id=REPO_ID, repo_type="dataset")
+              print(f"Dataset repo '{REPO_ID}' exists.")
           except RepositoryNotFoundError:
-              print(f"Dataset repo '{repo_id}' not found. Creating...")
-              create_repo(repo_id=repo_id, repo_type="dataset", private=False, token=os.environ["HF_TOKEN"])
-              print(f"Created dataset repo '{repo_id}'.")
+              print(f"Creating dataset repo '{REPO_ID}'...")
+              create_repo(repo_id=REPO_ID, repo_type="dataset", private=False, token=os.environ["HF_TOKEN"])
 
-          # Upload tourism.csv from this repo (expects file at tourism/tourism.csv)
-          api.upload_file(
-              path_or_fileobj="tourism/tourism.csv",
-              path_in_repo="tourism.csv",
-              repo_id=repo_id,
-              repo_type="dataset",
-          )
-          print("✅ Uploaded tourism.csv to dataset repo.")
+          # Skip upload if already present
+          files = set(api.list_repo_files(repo_id=REPO_ID, repo_type="dataset"))
+          if "tourism.csv" in files:
+              print("tourism.csv already present in dataset repo — skipping upload.")
+          else:
+              if not os.path.exists(LOCAL):
+                  raise SystemExit(f"❌ Missing local file: {LOCAL}")
+              api.upload_file(
+                  path_or_fileobj=LOCAL,
+                  path_in_repo="tourism.csv",
+                  repo_id=REPO_ID,
+                  repo_type="dataset",
+              )
+              print("✅ Uploaded tourism.csv to dataset repo.")
           PY
 
   data-prep:
@@ -69,13 +84,13 @@ jobs:
       - name: Install dependencies (prep)
         run: |
           python -m pip install --upgrade pip
-          pip install -r tourism/deployment/requirements.txt
+          pip install -r requirements.txt
 
       - name: Run Data Preparation (splits & upload Xtrain/Xtest/ytrain/ytest)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python tourism/model_building/prep.py
+          python model_building/prep.py
 
   model-traning:
     needs: data-prep
@@ -92,7 +107,7 @@ jobs:
       - name: Install dependencies (train + mlflow)
         run: |
           python -m pip install --upgrade pip
-          pip install -r tourism/deployment/requirements.txt
+          pip install -r requirements.txt
 
       - name: Start MLflow Server (background)
         run: |
@@ -106,7 +121,7 @@ jobs:
           MLFLOW_EXPERIMENT_NAME: tourism-wellness-package
           HF_MODEL_REPO: Ansh91/tourism
         run: |
-          python tourism/model_building/train.py
+          python model_building/train.py
 
   deploy-hosting:
     needs: [model-traning, data-prep, register-dataset]
@@ -129,4 +144,5 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python tourism/hosting/hosting.py
+          python hosting/hosting.py
+
